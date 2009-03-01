@@ -171,6 +171,59 @@ module Technoweenie # :nodoc:
           #  raise ConfigFileNotFoundError.new('File %s not found' % @@s3_config_path)
           end
 
+          ##
+          ##
+          ## BEGIN socket timeout hack
+          Connection.class_eval <<-EOV, __FILE__, __LINE__
+            alias_method :create_connection_without_timeout, :create_connection unless method_defined?(:create_connection_without_timeout) || private_method_defined?(:create_connection_without_timeout)
+
+            def create_connection
+              http = create_connection_without_timeout
+              http.open_timeout = options[:open_timeout] if !options[:open_timeout].nil?
+              http.read_timeout = options[:read_timeout] if !options[:read_timeout].nil?
+              http
+            end
+          EOV
+
+          Connection::Options.class_eval <<-EOV, __FILE__, __LINE__
+            class << self
+              alias_method :valid_options_without_timeout, :valid_options unless method_defined?(:valid_options_without_timeout) || private_method_defined?(:valid_options_without_timeout)
+
+              def valid_options
+                [:open_timeout, :read_timeout] + valid_options_without_timeout
+              end
+            end
+          EOV
+          ## END socket timeout hack
+          ##
+          ##
+
+
+          ##
+          ##
+          ## BEGIN win32 HTTP.request(File) hack
+          ## FIXME: ugly hack to get it running on windows; when giving file handle it sometimes hangs,
+          ## resulting in a 20s server-side timeout error: "Your socket connection to the server was
+          ## not read from or written to within the timeout period"
+          if RUBY_PLATFORM =~ /(:?mswin|mingw)/
+            S3Object.class_eval <<-EOV, __FILE__, __LINE__
+              class << self
+                alias_method :store_original, :store unless method_defined?(:store_original)
+                def store(key, data, bucket = nil, options = {})
+                  if data && data.is_a?(File)
+                    file = data
+                    data = file.binmode.read
+                    file.close
+                  end
+                  store_original(key, data, bucket, options)
+                end
+              end
+            EOV
+          end
+          ## END win32 HTTP.request(File) hack
+          ##
+          ##
+
           bucket_key = base.attachment_options[:bucket_key]
 
           if bucket_key and s3_config[bucket_key.to_sym]
@@ -180,7 +233,7 @@ module Technoweenie # :nodoc:
           end
           base.class_eval(eval_string, __FILE__, __LINE__)
 
-          Base.establish_connection!(s3_config.slice(:access_key_id, :secret_access_key, :server, :port, :use_ssl, :persistent, :proxy))
+          Base.establish_connection!(s3_config.slice(:access_key_id, :secret_access_key, :server, :port, :use_ssl, :persistent, :proxy, :open_timeout, :read_timeout))
 
           # Bucket.create(@@bucket_name)
 
@@ -247,7 +300,11 @@ module Technoweenie # :nodoc:
         #
         # The optional thumbnail argument will output the thumbnail's filename (if any).
         def s3_url(thumbnail = nil)
-          File.join(s3_protocol + s3_hostname + s3_port_string, bucket_name, full_filename(thumbnail))
+          if "#{s3_hostname}" == "#{bucket_name}.#{AWS::S3::DEFAULT_HOST}"
+            File.join(s3_protocol + s3_hostname + s3_port_string, full_filename(thumbnail))
+          else
+            File.join(s3_protocol + s3_hostname + s3_port_string, bucket_name, full_filename(thumbnail))
+          end
         end
         alias :public_filename :s3_url
 
